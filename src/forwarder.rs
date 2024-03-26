@@ -1,19 +1,15 @@
-use std::{
-    collections::HashMap,
-    convert::Infallible,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-};
+use std::collections::HashMap;
 
-use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty};
 use hyper::{
     body::{Bytes, Incoming},
-    Method, Request, Response,
+    Method, Request, Response, StatusCode,
 };
 
-use hyper_util::client::legacy::{connect::HttpConnector, Builder as ConnBuilder, Client};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use tokio::sync::oneshot;
 
-use crate::{error::compat::CompatibilityHyperError, local_executor::LocalExecutor};
+use crate::error::compat::CompatibilityHyperError;
 
 pub type OutgoingResponse = Response<UnsyncBoxBody<Bytes, CompatibilityHyperError>>;
 pub type IncomingResponse = Response<Incoming>;
@@ -83,13 +79,14 @@ impl App {
             .map_err(CompatibilityHyperError::from)
     }
 
-    fn select_backend(&self, req: &IncomingRequest) -> &AppBackend {
+    fn select_backend(&self, _req: &IncomingRequest) -> &AppBackend {
         unimplemented!()
     }
 }
 
 pub enum ForwarderMsg {
     IncomingConnection(IncomingRequest, oneshot::Sender<OutgoingResponse>),
+    PanicButton,
 }
 
 pub struct PathResolver {}
@@ -99,21 +96,44 @@ impl PathResolver {
         PathResolver {}
     }
 
-    pub fn resolve(&self, path: &str, method: &Method) -> Option<&App> {
+    pub fn resolve(&self, _path: &str, _method: &Method) -> Option<&App> {
         unimplemented!()
     }
 }
 
 pub struct Forwarder {
     pub receiver: tokio::sync::mpsc::Receiver<ForwarderMsg>,
+    pub loopback_sender: tokio::sync::mpsc::Sender<ForwarderMsg>,
     resolver: PathResolver,
 }
 
 impl Forwarder {
-    async fn handle_msg(&mut self, msg: ForwarderMsg) {
+    fn new(
+        receiver: tokio::sync::mpsc::Receiver<ForwarderMsg>,
+        resolver: PathResolver,
+        loopback_sender: tokio::sync::mpsc::Sender<ForwarderMsg>,
+    ) -> Forwarder {
+        Forwarder {
+            receiver,
+            resolver,
+            loopback_sender,
+        }
+    }
+
+    async fn handle_msg(
+        &mut self,
+        msg: ForwarderMsg,
+        loopback_sender: tokio::sync::mpsc::Sender<ForwarderMsg>,
+    ) -> Result<(), ()> {
         match msg {
+            ForwarderMsg::PanicButton => {
+                // We should shut down.
+                Err(())
+            }
             ForwarderMsg::IncomingConnection(req, doorman_reply_to) => {
-                self.handle_incoming_connection(req, doorman_reply_to).await;
+                self.handle_incoming_connection(req, doorman_reply_to, loopback_sender)
+                    .await;
+                Ok(())
             }
         }
     }
@@ -122,21 +142,46 @@ impl Forwarder {
         &mut self,
         req: IncomingRequest,
         doorman_reply_to: oneshot::Sender<OutgoingResponse>,
+        loopback_sender: tokio::sync::mpsc::Sender<ForwarderMsg>,
     ) {
         let app = match self.resolver.resolve(req.uri().path(), req.method()) {
             Some(a) => a,
             None => {
                 let response = Response::builder()
-                    .status(404)
-                    .body(Bytes::from("Not Found"))
+                    .status(StatusCode::NOT_FOUND)
+                    .body(
+                        Empty::<Bytes>::new()
+                            .map_err(CompatibilityHyperError::from)
+                            .boxed_unsync(),
+                    )
                     .unwrap();
-                doorman_reply_to.send(Ok(response)).unwrap();
+                if doorman_reply_to.send(response).is_err() {
+                    loopback_sender.blocking_send(ForwarderMsg::PanicButton);
+                }
                 return;
             }
         };
-        doorman_reply_to
-            .send(app.handle_request(req).await)
-            .unwrap();
+
+        // If the doorman fell over, we should shut down.
+        // They hold the connection to the client, so we can't do anything.
+        let shutdown: bool = match app.handle_request(req).await {
+            Ok(response) => doorman_reply_to.send(response).is_err(),
+            Err(_e) => {
+                let response = Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(
+                        Empty::<Bytes>::new()
+                            .map_err(CompatibilityHyperError::from)
+                            .boxed_unsync(),
+                    )
+                    .unwrap();
+                doorman_reply_to.send(response).is_err()
+            }
+        };
+
+        if shutdown {
+            loopback_sender.blocking_send(ForwarderMsg::PanicButton);
+        }
     }
 }
 
@@ -148,14 +193,22 @@ pub struct ForwarderHandle {
 impl ForwarderHandle {
     pub fn new() -> ForwarderHandle {
         let (sender, receiver) = tokio::sync::mpsc::channel(100);
-        let forwarder = Forwarder { receiver };
+
+        let resolver = PathResolver::new();
+
+        let forwarder = Forwarder::new(receiver, resolver, sender.clone());
+
         tokio::spawn(run_forwarder(forwarder));
+
         ForwarderHandle { sender }
     }
 }
 
 async fn run_forwarder(mut forwarder: Forwarder) {
     while let Some(msg) = forwarder.receiver.recv().await {
-        forwarder.handle_msg(msg).await;
+        let loopback_sender = forwarder.loopback_sender.clone();
+        if let Err(_) = forwarder.handle_msg(msg, loopback_sender).await {
+            return;
+        }
     }
 }

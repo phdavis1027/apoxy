@@ -1,17 +1,12 @@
-use std::{convert::Infallible, net::SocketAddr};
+use std::net::SocketAddr;
 
-use anyhow::anyhow;
-use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full};
-use hyper::{
-    body::{Bytes, Incoming},
-    service::service_fn,
-    Request, Response, StatusCode,
-};
+use http_body_util::{BodyExt, Empty};
+use hyper::{body::Bytes, service::service_fn, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    error::{compat::CompatibilityHyperError, ApoxyError},
+    error::compat::CompatibilityHyperError,
     forwarder::{ForwarderHandle, ForwarderMsg, IncomingRequest, OutgoingResponse},
     local_executor::LocalExecutor,
 };
@@ -93,7 +88,7 @@ async fn handle_incoming_connection(
     let forwarder = doorman.forwarder_handle.clone();
 
     match conn_attempt {
-        Ok((stream, addr)) => {
+        Ok((stream, _addr)) => {
             doorman
                 .http_connection_servicer
                 .serve_connection_with_upgrades(
@@ -105,7 +100,7 @@ async fn handle_incoming_connection(
                 .await;
         }
 
-        Err(e) => {
+        Err(_e) => {
             // Log the error
         }
     }
@@ -153,9 +148,8 @@ impl HttpDoormanHandle {
             http_connection_servicer,
             receiver,
             forwarder_handle,
-            sender.clone(),
         );
-        tokio::spawn(run_http_listener(actor));
+        tokio::spawn(run_http_listener(actor, sender.clone()));
 
         Self { sender }
     }
