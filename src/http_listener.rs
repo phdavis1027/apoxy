@@ -8,7 +8,7 @@ use hyper_util::rt::TokioIo;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    forwarder::{self, ForwarderHandle, ForwarderMsg},
+    forwarder::{ForwarderHandle, ForwarderMsg},
     local_executor::LocalExecutor,
 };
 
@@ -41,7 +41,7 @@ async fn serve_connection(
     req: Request<Incoming>,
     forwarder: ForwarderHandle,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let (tx, mut rx) = oneshot::channel();
+    let (tx, rx) = oneshot::channel();
     forwarder
         .sender
         .send(ForwarderMsg::IncomingConnection(req, tx))

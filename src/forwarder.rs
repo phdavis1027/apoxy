@@ -5,7 +5,10 @@ use hyper::{
     body::{Bytes, Incoming},
     Method, Request, Response,
 };
+use hyper_util::client::legacy::Builder;
 use tokio::sync::oneshot;
+
+use crate::local_executor::LocalExecutor;
 
 pub enum ForwarderMsg {
     IncomingConnection(
@@ -21,11 +24,8 @@ impl PathResolver {
         PathResolver {}
     }
 
-    pub async fn resolve(&self, path: &str, method: Method) -> Result<SocketAddr, anyhow::Error> {
-        Ok(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            8080,
-        ))
+    pub fn resolve(&self, path: &str, method: &Method) -> Option<Builder> {
+        unimplemented!()
     }
 }
 
@@ -35,9 +35,34 @@ pub struct Forwarder {
 }
 
 impl Forwarder {
-    async fn handle_msg(&self, msg: ForwarderMsg) {
+    async fn handle_msg(&mut self, msg: ForwarderMsg) {
         match msg {
-            ForwarderMsg::IncomingConnection(req, doorman_reply_to) => {}
+            ForwarderMsg::IncomingConnection(req, doorman_reply_to) => {
+                self.handle_incoming_connection(req, doorman_reply_to).await;
+            }
+        }
+    }
+
+    async fn handle_incoming_connection(
+        &mut self,
+        req: Request<Incoming>,
+        doorman_reply_to: oneshot::Sender<Result<Response<Full<Bytes>>, hyper::Error>>,
+    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        match self.resolver.resolve(req.uri().path(), req.method()) {
+            Some(builder) => {
+                let client = builder.build();
+                let response = client.request(req).await?;
+                doorman_reply_to.send(Ok(response)).unwrap();
+                Ok(response)
+            }
+            None => {
+                let response = Response::builder()
+                    .status(404)
+                    .body(Full::new(Bytes::from("Not Found")))
+                    .unwrap();
+                doorman_reply_to.send(Ok(response.clone())).unwrap();
+                Ok(response)
+            }
         }
     }
 }
