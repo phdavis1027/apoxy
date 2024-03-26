@@ -144,6 +144,9 @@ impl Forwarder {
         doorman_reply_to: oneshot::Sender<OutgoingResponse>,
         loopback_sender: tokio::sync::mpsc::Sender<ForwarderMsg>,
     ) {
+        const EXPECT_MSG: &str =
+            "This should not failed because if handle_msg was called, there must have been a valid sender";
+
         let app = match self.resolver.resolve(req.uri().path(), req.method()) {
             Some(a) => a,
             None => {
@@ -156,7 +159,9 @@ impl Forwarder {
                     )
                     .unwrap();
                 if doorman_reply_to.send(response).is_err() {
-                    loopback_sender.blocking_send(ForwarderMsg::PanicButton);
+                    loopback_sender
+                        .blocking_send(ForwarderMsg::PanicButton)
+                        .expect(EXPECT_MSG);
                 }
                 return;
             }
@@ -180,7 +185,9 @@ impl Forwarder {
         };
 
         if shutdown {
-            loopback_sender.blocking_send(ForwarderMsg::PanicButton);
+            loopback_sender
+                .blocking_send(ForwarderMsg::PanicButton)
+                .expect(EXPECT_MSG);
         }
     }
 }
