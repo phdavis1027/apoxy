@@ -1,0 +1,13 @@
+[package]
+name = "apoxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.81"
+hyper = "1.2.0"
+hyper-util = {version = "0.1.3", features = ["full"]}
+http-body-util = "0.1"
+ractor = "0.9.7"
+tokio = "1.36.0"
+async-trait = "0.1.79"
