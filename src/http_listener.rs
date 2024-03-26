@@ -1,4 +1,6 @@
-use http_body_util::Full;
+use std::convert::Infallible;
+
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full};
 use hyper::{
     body::{Bytes, Incoming},
     service::service_fn,
@@ -40,7 +42,7 @@ enum HttpDoormanMsg {}
 async fn serve_connection(
     req: Request<Incoming>,
     forwarder: ForwarderHandle,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<UnsyncBoxBody<Bytes, hyper::Error>>, hyper::Error> {
     let (tx, rx) = oneshot::channel();
     forwarder
         .sender
@@ -48,14 +50,21 @@ async fn serve_connection(
         .await;
 
     match rx.await {
-        Ok(response) => response,
+        Ok(result) => match result {
+            Ok(result) => result.map(|body| body.boxed_unsync()),
+            e => e,
+        },
         Err(_) => {
             // TODO: Reason about this
             // This is a bit of a hack. The forwarder has been dropped, so we can't send a response.
             // Instead, we just return a 500 error.
             Ok(Response::builder()
                 .status(500)
-                .body(Full::from(Bytes::from("Internal server error")))
+                .body(
+                    Empty::new()
+                        .map_err(|_| hyper::Error::from("Bad".into()))
+                        .boxed_unsync(),
+                )
                 .unwrap())
         }
     }

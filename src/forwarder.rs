@@ -1,19 +1,85 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
-use http_body_util::Full;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::{
     body::{Bytes, Incoming},
     Method, Request, Response,
 };
-use hyper_util::client::legacy::Builder;
+
+use hyper_util::client::legacy::{connect::HttpConnector, Builder as ConnBuilder, Client};
 use tokio::sync::oneshot;
 
 use crate::local_executor::LocalExecutor;
 
+enum LoadBalancingStrategy {
+    RoundRobin,
+    Random,
+    LeastConnections,
+}
+
+pub struct AppBackendMetrics {
+    pub active_connections: u64,
+    pub requests: u64,
+    pub errors: u64,
+}
+
+pub struct AppBackend {
+    client: Client<HttpConnector, Incoming>,
+    metrics: AppBackendMetrics,
+}
+
+impl AppBackend {
+    pub async fn handle_request(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
+        self.client.request(req).await
+    }
+}
+
+pub struct App {
+    load_balancing_strategy: LoadBalancingStrategy,
+    backends: HashMap<String, AppBackend>,
+}
+
+impl App {
+    pub async fn handle_request(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<Bytes>, hyper_util::client::legacy::Error> {
+        let backend = self.select_backend(&req);
+        let incoming = backend.handle_request(req).await;
+        self.incoming_to_outgoing(incoming).await
+    }
+
+    async fn incoming_to_outgoing(
+        &self,
+        incoming: Result<Response<Incoming>, hyper_util::client::legacy::Error>,
+    ) -> Result<Response<Bytes>, hyper_util::client::legacy::Error> {
+        match incoming {
+            Ok(incoming) => {
+                let response = Response::builder()
+                    .status(incoming.status())
+                    .body(incoming.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+                Ok(response)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn select_backend(&self, req: &Request<Incoming>) -> &AppBackend {
+        unimplemented!()
+    }
+}
+
 pub enum ForwarderMsg {
     IncomingConnection(
         Request<Incoming>,
-        oneshot::Sender<Result<Response<Full<Bytes>>, hyper::Error>>,
+        oneshot::Sender<Result<Response<Bytes>, hyper::Error>>,
     ),
 }
 
@@ -24,14 +90,14 @@ impl PathResolver {
         PathResolver {}
     }
 
-    pub fn resolve(&self, path: &str, method: &Method) -> Option<Builder> {
+    pub fn resolve(&self, path: &str, method: &Method) -> Option<&App> {
         unimplemented!()
     }
 }
 
 pub struct Forwarder {
     pub receiver: tokio::sync::mpsc::Receiver<ForwarderMsg>,
-    pub resolver: PathResolver,
+    resolver: PathResolver,
 }
 
 impl Forwarder {
@@ -46,24 +112,24 @@ impl Forwarder {
     async fn handle_incoming_connection(
         &mut self,
         req: Request<Incoming>,
-        doorman_reply_to: oneshot::Sender<Result<Response<Full<Bytes>>, hyper::Error>>,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        match self.resolver.resolve(req.uri().path(), req.method()) {
-            Some(builder) => {
-                let client = builder.build();
-                let response = client.request(req).await?;
-                doorman_reply_to.send(Ok(response)).unwrap();
-                Ok(response)
-            }
+        doorman_reply_to: oneshot::Sender<
+            Result<Response<UnsyncBoxBody<Bytes, hyper::Error>>, hyper_util::client::legacy::Error>,
+        >,
+    ) {
+        let app = match self.resolver.resolve(req.uri().path(), req.method()) {
+            Some(a) => a,
             None => {
                 let response = Response::builder()
                     .status(404)
-                    .body(Full::new(Bytes::from("Not Found")))
+                    .body(Bytes::from("Not Found"))
                     .unwrap();
-                doorman_reply_to.send(Ok(response.clone())).unwrap();
-                Ok(response)
+                doorman_reply_to.send(Ok(response)).unwrap();
+                return;
             }
-        }
+        };
+        doorman_reply_to
+            .send(app.handle_request(req).await)
+            .unwrap();
     }
 }
 
