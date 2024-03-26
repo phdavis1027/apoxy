@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
@@ -32,11 +33,10 @@ pub struct AppBackend {
 }
 
 impl AppBackend {
-    pub async fn handle_request(
+    pub async fn send_request(
         &self,
         req: Request<Incoming>,
-    ) -> Result<Response<UnsyncBoxBody<Bytes, hyper::Error>>, hyper_util::client::legacy::Error>
-    {
+    ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
         self.client.request(req).await
     }
 }
@@ -50,9 +50,9 @@ impl App {
     pub async fn handle_request(
         &self,
         req: Request<Incoming>,
-    ) -> Result<Response<Bytes>, hyper::Error> {
+    ) -> Result<Response<UnsyncBoxBody<Bytes, hyper::Error>>, hyper::Error> {
         let backend = self.select_backend(&req);
-        let incoming = backend.handle_request(req).await;
+        let incoming = backend.send_request(req).await;
         self.incoming_to_outgoing(incoming).await
     }
 
@@ -60,16 +60,16 @@ impl App {
     async fn incoming_to_outgoing(
         &self,
         incoming: Result<Response<Incoming>, hyper_util::client::legacy::Error>,
-    ) -> Result<Response<Bytes>, hyper::Error> {
+    ) -> Result<Response<UnsyncBoxBody<Bytes, hyper::Error>>, hyper::Error> {
         match incoming {
-            Ok(incoming) => {
-                let response = Response::builder()
-                    .status(incoming.status())
-                    .body(incoming.into_body().collect().await?.to_bytes())
-                    // UNWRAP: Not safe, fix me
-                    .unwrap();
-                Ok(response)
-            }
+            Ok(incoming) => Response::builder().status(incoming.status()).body(
+                incoming
+                    .into_body()
+                    .collect()
+                    .await?
+                    .map_err(|_| hyper::Error::from("Infallible".into()))
+                    .boxed_unsync(),
+            ),
             Err(e) => Err(hyper::Error::from(e)),
         }
     }
