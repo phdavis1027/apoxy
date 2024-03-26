@@ -13,7 +13,13 @@ use hyper::{
 use hyper_util::client::legacy::{connect::HttpConnector, Builder as ConnBuilder, Client};
 use tokio::sync::oneshot;
 
-use crate::local_executor::LocalExecutor;
+use crate::{error::compat::CompatibilityHyperError, local_executor::LocalExecutor};
+
+pub type OutgoingResponse = Response<UnsyncBoxBody<Bytes, CompatibilityHyperError>>;
+pub type IncomingResponse = Response<Incoming>;
+
+pub type OutgoingRequest = Request<UnsyncBoxBody<Bytes, CompatibilityHyperError>>;
+pub type IncomingRequest = Request<Incoming>;
 
 enum LoadBalancingStrategy {
     RoundRobin,
@@ -33,11 +39,14 @@ pub struct AppBackend {
 }
 
 impl AppBackend {
-    pub async fn send_request(
+    pub async fn send_incoming_request(
         &self,
         req: Request<Incoming>,
-    ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
-        self.client.request(req).await
+    ) -> Result<IncomingResponse, CompatibilityHyperError> {
+        self.client
+            .request(req)
+            .await
+            .map_err(CompatibilityHyperError::from)
     }
 }
 
@@ -49,41 +58,38 @@ pub struct App {
 impl App {
     pub async fn handle_request(
         &self,
-        req: Request<Incoming>,
-    ) -> Result<Response<UnsyncBoxBody<Bytes, hyper::Error>>, hyper::Error> {
+        req: IncomingRequest,
+    ) -> Result<OutgoingResponse, CompatibilityHyperError> {
         let backend = self.select_backend(&req);
-        let incoming = backend.send_request(req).await;
+        let incoming = backend.send_incoming_request(req).await;
         self.incoming_to_outgoing(incoming).await
     }
 
     // Part of why this is necessary is to convert away from a legacy error
     async fn incoming_to_outgoing(
         &self,
-        incoming: Result<Response<Incoming>, hyper_util::client::legacy::Error>,
-    ) -> Result<Response<UnsyncBoxBody<Bytes, hyper::Error>>, hyper::Error> {
-        match incoming {
-            Ok(incoming) => Response::builder().status(incoming.status()).body(
-                incoming
-                    .into_body()
-                    .collect()
-                    .await?
-                    .map_err(|_| hyper::Error::from("Infallible".into()))
-                    .boxed_unsync(),
-            ),
-            Err(e) => Err(hyper::Error::from(e)),
-        }
+        incoming: Result<Response<Incoming>, CompatibilityHyperError>,
+    ) -> Result<OutgoingResponse, CompatibilityHyperError> {
+        let (parts, body) = incoming?.into_parts();
+        let body = body
+            .collect()
+            .await?
+            .map_err(CompatibilityHyperError::from)
+            .boxed_unsync();
+
+        Response::builder()
+            .status(parts.status)
+            .body(body)
+            .map_err(CompatibilityHyperError::from)
     }
 
-    fn select_backend(&self, req: &Request<Incoming>) -> &AppBackend {
+    fn select_backend(&self, req: &IncomingRequest) -> &AppBackend {
         unimplemented!()
     }
 }
 
 pub enum ForwarderMsg {
-    IncomingConnection(
-        Request<Incoming>,
-        oneshot::Sender<Result<Response<Bytes>, hyper::Error>>,
-    ),
+    IncomingConnection(IncomingRequest, oneshot::Sender<OutgoingResponse>),
 }
 
 pub struct PathResolver {}
@@ -114,10 +120,8 @@ impl Forwarder {
 
     async fn handle_incoming_connection(
         &mut self,
-        req: Request<Incoming>,
-        doorman_reply_to: oneshot::Sender<
-            Result<Response<UnsyncBoxBody<Bytes, hyper::Error>>, hyper_util::client::legacy::Error>,
-        >,
+        req: IncomingRequest,
+        doorman_reply_to: oneshot::Sender<OutgoingResponse>,
     ) {
         let app = match self.resolver.resolve(req.uri().path(), req.method()) {
             Some(a) => a,

@@ -1,16 +1,18 @@
 use std::convert::Infallible;
 
+use anyhow::anyhow;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full};
 use hyper::{
     body::{Bytes, Incoming},
     service::service_fn,
-    Request, Response,
+    Request, Response, StatusCode,
 };
 use hyper_util::rt::TokioIo;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    forwarder::{ForwarderHandle, ForwarderMsg},
+    error::compat::CompatibilityHyperError,
+    forwarder::{ForwarderHandle, ForwarderMsg, IncomingRequest, OutgoingResponse},
     local_executor::LocalExecutor,
 };
 
@@ -40,9 +42,9 @@ impl HttpDoorman {
 enum HttpDoormanMsg {}
 
 async fn serve_connection(
-    req: Request<Incoming>,
+    req: IncomingRequest,
     forwarder: ForwarderHandle,
-) -> Result<Response<UnsyncBoxBody<Bytes, hyper::Error>>, hyper::Error> {
+) -> Result<OutgoingResponse, CompatibilityHyperError> {
     let (tx, rx) = oneshot::channel();
     forwarder
         .sender
@@ -50,22 +52,13 @@ async fn serve_connection(
         .await;
 
     match rx.await {
-        Ok(result) => match result {
-            Ok(result) => result.map(|body| body.boxed_unsync()),
-            e => e,
-        },
-        Err(_) => {
-            // TODO: Reason about this
-            // This is a bit of a hack. The forwarder has been dropped, so we can't send a response.
-            // Instead, we just return a 500 error.
-            Ok(Response::builder()
-                .status(500)
-                .body(
-                    Empty::new()
-                        .map_err(|_| hyper::Error::from("Bad".into()))
-                        .boxed_unsync(),
-                )
-                .unwrap())
+        Ok(response) => Ok(response), // This cringe is needed to convince the compiler that the error type is correct
+        Err(e) => {
+            let response = Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Empty::new().boxed_unsync());
+
+            Ok(response)
         }
     }
 }
