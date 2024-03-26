@@ -35,7 +35,8 @@ impl AppBackend {
     pub async fn handle_request(
         &self,
         req: Request<Incoming>,
-    ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
+    ) -> Result<Response<UnsyncBoxBody<Bytes, hyper::Error>>, hyper_util::client::legacy::Error>
+    {
         self.client.request(req).await
     }
 }
@@ -49,25 +50,27 @@ impl App {
     pub async fn handle_request(
         &self,
         req: Request<Incoming>,
-    ) -> Result<Response<Bytes>, hyper_util::client::legacy::Error> {
+    ) -> Result<Response<Bytes>, hyper::Error> {
         let backend = self.select_backend(&req);
         let incoming = backend.handle_request(req).await;
         self.incoming_to_outgoing(incoming).await
     }
 
+    // Part of why this is necessary is to convert away from a legacy error
     async fn incoming_to_outgoing(
         &self,
         incoming: Result<Response<Incoming>, hyper_util::client::legacy::Error>,
-    ) -> Result<Response<Bytes>, hyper_util::client::legacy::Error> {
+    ) -> Result<Response<Bytes>, hyper::Error> {
         match incoming {
             Ok(incoming) => {
                 let response = Response::builder()
                     .status(incoming.status())
-                    .body(incoming.into_body().collect().await.unwrap().to_bytes())
+                    .body(incoming.into_body().collect().await?.to_bytes())
+                    // UNWRAP: Not safe, fix me
                     .unwrap();
                 Ok(response)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(hyper::Error::from(e)),
         }
     }
 
